@@ -39,13 +39,13 @@ import (
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/membershippb"
 	"go.etcd.io/etcd/api/v3/version"
-	"go.etcd.io/etcd/pkg/v3/fileutil"
+	"go.etcd.io/etcd/client/pkg/v3/fileutil"
+	"go.etcd.io/etcd/client/pkg/v3/types"
 	"go.etcd.io/etcd/pkg/v3/idutil"
 	"go.etcd.io/etcd/pkg/v3/pbutil"
 	"go.etcd.io/etcd/pkg/v3/runtime"
 	"go.etcd.io/etcd/pkg/v3/schedule"
 	"go.etcd.io/etcd/pkg/v3/traceutil"
-	"go.etcd.io/etcd/pkg/v3/types"
 	"go.etcd.io/etcd/pkg/v3/wait"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
@@ -273,10 +273,6 @@ type EtcdServer struct {
 	peerRt   http.RoundTripper
 	reqIDGen *idutil.Generator
 
-	// forceVersionC is used to force the version monitor loop
-	// to detect the cluster version immediately.
-	forceVersionC chan struct{}
-
 	// wgMu blocks concurrent waitgroup mutation while server stopping
 	wgMu sync.RWMutex
 	// wg is used to wait for the goroutines that depends on the server state
@@ -290,6 +286,9 @@ type EtcdServer struct {
 
 	leadTimeMu      sync.RWMutex
 	leadElectedTime time.Time
+
+	firstCommitInTermMu sync.RWMutex
+	firstCommitInTermC  chan struct{}
 
 	*AccessController
 }
@@ -517,17 +516,17 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 				storage:     NewStorage(w, ss),
 			},
 		),
-		id:               id,
-		attributes:       membership.Attributes{Name: cfg.Name, ClientURLs: cfg.ClientURLs.StringSlice()},
-		cluster:          cl,
-		stats:            sstats,
-		lstats:           lstats,
-		SyncTicker:       time.NewTicker(500 * time.Millisecond),
-		peerRt:           prt,
-		reqIDGen:         idutil.NewGenerator(uint16(id), time.Now()),
-		forceVersionC:    make(chan struct{}),
-		AccessController: &AccessController{CORS: cfg.CORS, HostWhitelist: cfg.HostWhitelist},
-		consistIndex:     cindex.NewConsistentIndex(be.BatchTx()),
+		id:                 id,
+		attributes:         membership.Attributes{Name: cfg.Name, ClientURLs: cfg.ClientURLs.StringSlice()},
+		cluster:            cl,
+		stats:              sstats,
+		lstats:             lstats,
+		SyncTicker:         time.NewTicker(500 * time.Millisecond),
+		peerRt:             prt,
+		reqIDGen:           idutil.NewGenerator(uint16(id), time.Now()),
+		AccessController:   &AccessController{CORS: cfg.CORS, HostWhitelist: cfg.HostWhitelist},
+		consistIndex:       cindex.NewConsistentIndex(be.BatchTx()),
+		firstCommitInTermC: make(chan struct{}),
 	}
 	serverID.With(prometheus.Labels{"server_id": id.String()}).Set(1)
 
@@ -721,6 +720,8 @@ func (s *EtcdServer) adjustTicks() {
 func (s *EtcdServer) Start() {
 	s.start()
 	s.GoAttach(func() { s.adjustTicks() })
+	// TODO: Switch to publishV3 in 3.6.
+	// Support for cluster_member_set_attr was added in 3.5.
 	s.GoAttach(func() { s.publish(s.Cfg.ReqTimeout()) })
 	s.GoAttach(s.purgeFile)
 	s.GoAttach(func() { monitorFileDescriptor(s.Logger(), s.stopping) })
@@ -1768,6 +1769,16 @@ func (s *EtcdServer) LeaderChangedNotify() <-chan struct{} {
 	return s.leaderChanged
 }
 
+// FirstCommitInTermNotify returns channel that will be unlocked on first
+// entry committed in new term, which is necessary for new leader to answer
+// read-only requests (leader is not able to respond any read-only requests
+// as long as linearizable semantic is required)
+func (s *EtcdServer) FirstCommitInTermNotify() <-chan struct{} {
+	s.firstCommitInTermMu.RLock()
+	defer s.firstCommitInTermMu.RUnlock()
+	return s.firstCommitInTermC
+}
+
 // RaftStatusGetter represents etcd server and Raft progress.
 type RaftStatusGetter interface {
 	ID() types.ID
@@ -1855,7 +1866,6 @@ func (s *EtcdServer) sync(timeout time.Duration) {
 // with the static clientURLs of the server.
 // The function keeps attempting to register until it succeeds,
 // or its server is stopped.
-// TODO: replace publish() in 3.6
 func (s *EtcdServer) publishV3(timeout time.Duration) {
 	req := &membershippb.ClusterMemberAttrSetRequest{
 		Member_ID: uint64(s.id),
@@ -1916,7 +1926,7 @@ func (s *EtcdServer) publishV3(timeout time.Duration) {
 // but does not go through v2 API endpoint, which means even with v2
 // client handler disabled (e.g. --enable-v2=false), cluster can still
 // process publish requests through rafthttp
-// TODO: Deprecate v2 store in 3.6
+// TODO: Remove in 3.6 (start using publishV3)
 func (s *EtcdServer) publish(timeout time.Duration) {
 	lg := s.Logger()
 	b, err := json.Marshal(s.attributes)
@@ -2067,10 +2077,8 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 	// raft state machine may generate noop entry when leader confirmation.
 	// skip it in advance to avoid some potential bug in the future
 	if len(e.Data) == 0 {
-		select {
-		case s.forceVersionC <- struct{}{}:
-		default:
-		}
+		s.notifyAboutFirstCommitInTerm()
+
 		// promote lessor when the local member is leader and finished
 		// applying all entries from the last term.
 		if s.isLeader() {
@@ -2137,6 +2145,15 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 		s.raftRequest(s.ctx, pb.InternalRaftRequest{Alarm: a})
 		s.w.Trigger(id, ar)
 	})
+}
+
+func (s *EtcdServer) notifyAboutFirstCommitInTerm() {
+	newNotifier := make(chan struct{})
+	s.firstCommitInTermMu.Lock()
+	notifierToClose := s.firstCommitInTermC
+	s.firstCommitInTermC = newNotifier
+	s.firstCommitInTermMu.Unlock()
+	close(notifierToClose)
 }
 
 // applyConfChange applies a ConfChange to the server. It is only
@@ -2318,7 +2335,7 @@ func (s *EtcdServer) ClusterVersion() *semver.Version {
 func (s *EtcdServer) monitorVersions() {
 	for {
 		select {
-		case <-s.forceVersionC:
+		case <-s.FirstCommitInTermNotify():
 		case <-time.After(monitorVersionInterval):
 		case <-s.stopping:
 			return
